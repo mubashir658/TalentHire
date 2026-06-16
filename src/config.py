@@ -1,0 +1,1 @@
+# JD text, weights, thresholds
