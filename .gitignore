@@ -1,1 +1,17 @@
+# Data folder (large files, not to be committed)
 India_runs_data_and_ai_challenge/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+src/__pycache__/
+
+# Virtual environment
+.venv/
+
+# Outputs (generated CSVs)
+outputs/
+
+# macOS
+.DS_Store

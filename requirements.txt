@@ -1,1 +1,6 @@
-# Dependencies
+pandas
+numpy
+scikit-learn
+sentence-transformers
+pyyaml
+streamlit
