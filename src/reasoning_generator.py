@@ -1,136 +1,226 @@
-import random
-import re
+"""
+reasoning_generator.py
+========================
+Generates a 1–2 sentence, fact-grounded reasoning string for each ranked
+candidate.
 
-def generate_reasoning(cand, rank, features, match_details):
+RULES (from submission_spec.txt Stage 4 evaluation checks):
+────────────────────────────────────────────────────────────
+  ✅ Specific facts    — reference actual YOE, title, matched skills, signals
+  ✅ JD connection     — mention specific JD requirements, not generic praise
+  ✅ Honest concerns   — acknowledge gaps / red flags where they exist
+  ✅ No hallucination  — every claim must be in the candidate's profile
+  ✅ Variation         — no two candidates get the same string
+  ✅ Rank consistency  — tone matches rank (glowing at #1, cautious at #95)
+
+  ❌ NO random.choice templating
+  ❌ NO generic praise without evidence
+  ❌ NO skills mentioned that don't appear in the candidate's profile
+
+APPROACH:
+    Build the reasoning from discrete, observed facts then compose a sentence.
+    Tone is determined by the composite score bucket, not randomly.
+"""
+
+from datetime import datetime
+
+REFERENCE_DATE = datetime(2026, 6, 1)
+
+
+def _days_since(date_str: str) -> int | None:
+    if not date_str:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y-%m", "%Y"):
+        try:
+            d = datetime.strptime(date_str, fmt)
+            return (REFERENCE_DATE - d).days
+        except ValueError:
+            continue
+    return None
+
+
+def generate_reasoning(cand: dict, rank: int, features: dict,
+                       components: dict, criteria) -> str:
     """
-    Generates a high-quality, 1-2 sentence non-templated reasoning string
-    for a candidate, based on their actual profile facts, rank, and features.
+    Generate a non-templated, fact-based 1–2 sentence reasoning.
+
+    Args:
+        cand       : Full candidate dict
+        rank       : Assigned rank (1-based)
+        features   : Feature dict from feature_engineer.extract_features()
+        components : Score component dict from scorer.calculate_composite_score()
+        criteria   : DynamicCriteria from jd_parser (for JD-specific references)
+
+    Returns:
+        str : 1–2 sentence reasoning, max ~280 chars
     """
-    profile = cand["profile"]
-    yoe = profile.get("years_of_experience", 0)
-    title = profile.get("current_title", "Software Engineer")
-    company = profile.get("current_company", "")
-    location = profile.get("location", "")
-    willing_to_relocate = cand["redrob_signals"].get("willing_to_relocate", False)
-    notice_days = cand["redrob_signals"].get("notice_period_days", 90)
-    rrr = int(cand["redrob_signals"].get("recruiter_response_rate", 1.0) * 100)
-    
-    # Get matched skills/terms from match_details
-    matched_skills = match_details.get("matched_terms", [])
-    # Limit to top 3-4 matched skills for conciseness
-    skills_to_show = [s for s in matched_skills if s in ["vector search", "pinecone", "weaviate", "qdrant", "milvus", "embeddings", "semantic search", "ndcg", "mrr", "map", "rag", "fine-tuning", "lora", "python"]]
-    if not skills_to_show:
-        skills_to_show = matched_skills[:3]
+    profile  = cand["profile"]
+    signals  = cand.get("redrob_signals", {})
+
+    yoe      = profile.get("years_of_experience", 0)
+    title    = profile.get("current_title", "engineer") or "engineer"
+    company  = profile.get("current_company", "") or ""
+    location = profile.get("location", "") or ""
+    country  = profile.get("country", "") or ""
+
+    notice   = signals.get("notice_period_days", 90)
+    rrr      = signals.get("recruiter_response_rate", 0.5)
+    active   = signals.get("last_active_date", "")
+    open_wk  = signals.get("open_to_work_flag", False)
+    gh_score = signals.get("github_activity_score", -1)
+
+    # ── Skill evidence: what core/preferred skills were actually found ─────
+    # Re-derive from the candidate profile text so we mention REAL skills
+    skill_names = {s.get("name", "").lower() for s in cand.get("skills", [])}
+    history_text = " ".join(
+        (j.get("description", "") or "").lower()
+        for j in cand.get("career_history", [])
+    )
+    profile_text = (
+        (profile.get("headline", "") or "") + " " +
+        (profile.get("summary", "") or "")
+    ).lower()
+    full_text = " ".join(skill_names) + " " + history_text + " " + profile_text
+
+    matched_core = [sk for sk in criteria.core_skills   if sk in full_text]
+    matched_pref = [sk for sk in criteria.preferred_skills if sk in full_text]
+
+    # ── Build fact fragments ───────────────────────────────────────────────
+
+    # YOE fact
+    lo, hi = criteria.min_yoe, criteria.max_yoe
+    if lo <= yoe <= hi:
+        yoe_fact = f"{yoe:.0f} yrs exp (within JD range {lo:.0f}–{hi:.0f})"
+    elif yoe < lo:
+        yoe_fact = f"{yoe:.0f} yrs exp (below JD min of {lo:.0f})"
     else:
-        skills_to_show = skills_to_show[:3]
-        
-    skills_str = ", ".join(skills_to_show) if skills_to_show else "machine learning"
-    
-    # Highlight warnings/concerns
-    warnings = []
-    if notice_days > 90:
-        warnings.append(f"long notice period of {notice_days} days")
-    if rrr < 20:
-        warnings.append(f"low recruiter response rate of {rrr}%")
-    if features.get("avail_warnings"):
-        # Add first warning from features if available
-        warnings.append(features["avail_warnings"][0])
-        
-    warnings_str = " and ".join(warnings) if warnings else ""
-    
-    # Noida/Pune check
-    is_pune_noida = features.get("loc_preferred", False)
-    if is_pune_noida:
-        loc_str = f"based in {location} (preferred hybrid location)"
-    elif willing_to_relocate:
-        loc_str = f"willing to relocate from {location}"
+        yoe_fact = f"{yoe:.0f} yrs exp (above JD max of {hi:.0f})"
+
+    # Title/company fact
+    if company:
+        role_fact = f"{title} at {company}"
     else:
-        loc_str = f"located in {location} (not willing to relocate)"
-        
-    # Variation of openers and connectors based on rank range
-    if rank <= 15:
-        # Top-tier reasoning (very positive, highlights strong alignment)
-        openers = [
-            f"Exceptional Senior AI Engineer with {yoe} years of experience, currently working as {title} at {company if company else 'a product company'}.",
-            f"Top-tier candidate possessing {yoe} years of hands-on ML experience, currently holding the title of {title}.",
-            f"Highly relevant {yoe}-year senior engineering profile with a strong track record as {title}."
-        ]
-        mid_connectors = [
-            f"Demonstrated production depth in {skills_str}, aligning perfectly with the JD's search and retrieval requirements.",
-            f"Proven experience deploying systems involving {skills_str} directly to production environments.",
-            f"Strong expertise in core search and IR concepts, including {skills_str}."
-        ]
-        closers = [
-            f"Strong fit due to being {loc_str} with a fast notice period of {notice_days} days.",
-            f"Candidate is {loc_str}; highly engaged with an active recruiter response rate of {rrr}%.",
-            f"Ready to contribute to the founding team from day one; {loc_str}."
-        ]
-        
-        opener = random.choice(openers)
-        connector = random.choice(mid_connectors)
-        closer = random.choice(closers)
-        
-        if warnings_str:
-            closer = f"Note: there is a slight concern with {warnings_str}, but their strong technical fit outweighs this. {loc_str}."
-            
-        reasoning = f"{opener} {connector} {closer}"
-        
+        role_fact = title
+
+    # Skill fact
+    if matched_core:
+        skill_fact = f"matches {len(matched_core)}/{len(criteria.core_skills)} core JD skills ({', '.join(matched_core[:3])}{'...' if len(matched_core) > 3 else ''})"
+    elif matched_pref:
+        skill_fact = f"no core skills matched but shows {', '.join(matched_pref[:2])} (preferred)"
+    else:
+        skill_fact = "no direct skill overlap with JD requirements"
+
+    # Location fact
+    loc_score = features["loc_score"]
+    if loc_score >= 0.9:
+        loc_fact = f"based in {location} (preferred JD location)"
+    elif loc_score >= 0.5:
+        loc_fact = f"in {location}, willing to relocate"
+    elif country.lower() != "india" and criteria.is_india_role:
+        loc_fact = f"outside India ({country})"
+    else:
+        loc_fact = f"in {location}, not willing to relocate"
+
+    # Availability fact
+    days_inactive = _days_since(active)
+    if open_wk:
+        avail_fact = "actively open to work"
+    elif days_inactive and days_inactive <= 30:
+        avail_fact = f"active recently ({days_inactive}d ago)"
+    elif days_inactive and days_inactive > 180:
+        avail_fact = f"inactive {days_inactive} days"
+    else:
+        avail_fact = f"response rate {rrr:.0%}"
+
+    # Notice fact
+    if notice <= 30:
+        notice_fact = f"notice ≤30d"
+    elif notice > 90:
+        notice_fact = f"long notice ({notice}d)"
+    else:
+        notice_fact = f"notice {notice}d"
+
+    # Red flags
+    redflags = features.get("redflags", [])
+    redflag_fact = redflags[0] if redflags else ""
+
+    # GitHub fact (only mention if meaningful)
+    if gh_score >= 60:
+        gh_fact = f"strong GitHub activity ({gh_score}/100)"
+    elif gh_score > 0:
+        gh_fact = ""
+    else:
+        gh_fact = ""
+
+    # ── Compose reasoning based on rank tier ──────────────────────────────
+
+    if rank <= 10:
+        # Top-10: lead with skill+role strength, close with availability
+        sentence1 = (
+            f"{role_fact}, {yoe_fact}; "
+            f"{skill_fact}."
+        )
+        concerns = []
+        if redflag_fact:
+            concerns.append(redflag_fact)
+        if notice > 90:
+            concerns.append(notice_fact)
+        if days_inactive and days_inactive > 90:
+            concerns.append(avail_fact)
+
+        if concerns:
+            sentence2 = (
+                f"Concern: {concerns[0]}; "
+                f"overall top fit given {loc_fact} and {avail_fact}."
+            )
+        else:
+            extras = [loc_fact, avail_fact]
+            if gh_fact:
+                extras.append(gh_fact)
+            sentence2 = f"Strong fit: {'; '.join(extras)}."
+
+    elif rank <= 30:
+        # Ranks 11–30: solid fit, acknowledge one trade-off
+        sentence1 = (
+            f"{role_fact} with {yoe_fact}; "
+            f"{skill_fact}."
+        )
+        trade_off = redflag_fact or (notice_fact if notice > 60 else "") or avail_fact
+        sentence2 = (
+            f"{loc_fact.capitalize()}, {notice_fact}; "
+            f"{'concern: ' + trade_off + '.' if trade_off and trade_off != avail_fact else avail_fact + '.'}"
+        )
+
     elif rank <= 60:
-        # Mid-tier reasoning (solid fit, mentions some trade-offs or standard profile details)
-        openers = [
-            f"Solid Senior Engineer with {yoe} years of experience in product environments as {title}.",
-            f"Experienced {title} with {yoe} years of experience, matching the experience range of the JD.",
-            f"Candidate profile shows {yoe} years of experience, currently focused on backend/ML systems."
-        ]
-        mid_connectors = [
-            f"Possesses relevant expertise in {skills_str} and system design.",
-            f"Good familiarity with retrieval structures like {skills_str}.",
-            f"Has worked on projects involving {skills_str}."
-        ]
-        closers = [
-            f"Fits the location criteria ({loc_str}) with a notice period of {notice_days} days.",
-            f"A strong contributor who is {loc_str} (response rate: {rrr}%).",
-            f"Heuristic scoring indicates a highly stable profile; candidate is {loc_str}."
-        ]
-        
-        opener = random.choice(openers)
-        connector = random.choice(mid_connectors)
-        closer = random.choice(closers)
-        
-        if warnings_str:
-            closer = f"However, they have {warnings_str}. Currently {loc_str}."
-            
-        reasoning = f"{opener} {connector} {closer}"
-        
+        # Ranks 31–60: moderate fit, honest about gaps
+        sentence1 = (
+            f"{yoe_fact} as {title}; "
+            f"{skill_fact}."
+        )
+        gap_note = redflag_fact if redflag_fact else f"partial skill overlap with JD"
+        sentence2 = (
+            f"Gap: {gap_note}. "
+            f"{loc_fact.capitalize()}, {notice_fact}, {avail_fact}."
+        )
+
     else:
-        # Lower-tier reasoning (acknowledges gap, adjacent skills, or why they are at the bottom of the top 100)
-        openers = [
-            f"Adjacent engineering profile with {yoe} years of experience, currently working as {title}.",
-            f"Software engineer with {yoe} years of experience showing interest in moving to AI/ML systems.",
-            f"Candidate has {yoe} years of experience, with some adjacent skills but less direct production AI experience."
-        ]
-        mid_connectors = [
-            f"Has some experience with {skills_str}, but lacks the deep vector database or evaluation background required.",
-            f"Lists skills like {skills_str}, but the career history shows less focus on search and retrieval.",
-            f"Familiar with standard engineering practices and has basic exposure to {skills_str}."
-        ]
-        closers = [
-            f"Included as a potential candidate given their {loc_str} and notice period.",
-            f"Potential match if other options are exhausted; {loc_str}.",
-            f"Heuristic score is lower due to {warnings_str or 'notice period constraints'}; {loc_str}."
-        ]
-        
-        opener = random.choice(openers)
-        connector = random.choice(mid_connectors)
-        closer = random.choice(closers)
-        
-        reasoning = f"{opener} {connector} {closer}"
-        
-    # Ensure no double spaces and clean text
+        # Ranks 61–100: adjacent or weak fit, be honest
+        sentence1 = (
+            f"{yoe_fact} as {title}; "
+            f"{skill_fact}."
+        )
+        why_low = redflag_fact if redflag_fact else "limited direct JD skill match"
+        sentence2 = (
+            f"Ranked lower due to {why_low}; "
+            f"{loc_fact}, {notice_fact}."
+        )
+
+    # ── Clean and enforce length ───────────────────────────────────────────
+    reasoning = f"{sentence1} {sentence2}"
+    # Collapse multiple spaces
     reasoning = " ".join(reasoning.split())
-    # Truncate to maximum 2 sentences if needed (split by period and take first two)
-    sentences = re.split(r'\. ', reasoning)
-    if len(sentences) > 2:
-        reasoning = ". ".join(sentences[:2]) + "."
-        
+    # Ensure max ~300 chars (the spec says "1-2 sentences")
+    if len(reasoning) > 300:
+        reasoning = reasoning[:297] + "..."
+
     return reasoning
